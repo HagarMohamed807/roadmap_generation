@@ -1,83 +1,129 @@
 """
 Syntra.AI — Roadmap Factory Microservice
 POST /generate-roadmap
-
-Pipeline:
-  1. Intelligence  → Gemini 1.5 Flash generates a structured roadmap JSON
-  2. Verification  → youtube-search-python fills in real tutorial links
-  3. Personalization → hours_per_week groups skills into weekly schedules
 """
 
 import os
+import re
 import json
 import asyncio
 import logging
+import threading
 from typing import List
 
 import google.generativeai as genai
+from duckduckgo_search import DDGS
 from youtubesearchpython import VideosSearch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Config & Logging
-# ---------------------------------------------------------------------------
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("roadmap_factory")
 
+# ── Config ──────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-YT_MAX_RESULTS = int(os.getenv("YT_MAX_RESULTS", "3"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+YT_LIMIT = int(os.getenv("YT_SEARCH_LIMIT", "5"))
+YT_MIN_SEC = int(os.getenv("YT_MIN_DURATION_SEC", "600"))
+CONCURRENCY = int(os.getenv("ENRICH_CONCURRENCY", "10"))
+
+SKIP_DOMAINS = ("pinterest.", "facebook.", "twitter.", "x.com", "instagram.", "tiktok.")
+SEARCH_PAGES = ("/search?", "/search/", "google.com/search", "youtube.com/results", "bing.com/search", "duckduckgo.com/")
+YT_GOOD = ("tutorial", "course", "learn", "explained", "guide", "introduction", "basics", "fundamentals", "full", "complete")
+YT_BAD = ("shorts", "in 5 minutes", "in 10 minutes", "speed run", "trailer", "reaction", "tiktok")
+ART_GOOD = ("tutorial", "guide", "documentation", "docs", "learn", "introduction")
+
+_ddg_lock = threading.Lock()
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set. Check your .env file.")
-
 genai.configure(api_key=GEMINI_API_KEY)
+logger.info("Gemini model: %s", GEMINI_MODEL)
 
-# ---------------------------------------------------------------------------
-# Pydantic Schemas
-# ---------------------------------------------------------------------------
-
+# ── Schemas ───────────────────────────────────────────────────────────────────
 class RoadmapRequest(BaseModel):
-    track_name: str      = Field(..., example="Frontend Web Development")
-    hours_per_week: int  = Field(..., ge=1, le=168, example=10)
-
+    track_name: str = Field(..., example="Frontend Web Development")
+    hours_per_week: int = Field(..., ge=1, le=168, example=10)
 
 class ResourceSchema(BaseModel):
-    youtube_link:    str
-    book_reference:  str
-    article_link:    str
-
+    youtube_link: str
+    book_reference: str
+    article_link: str
 
 class SkillSchema(BaseModel):
-    skill_name:      str
+    skill_name: str
     estimated_hours: float
-    resources:       ResourceSchema
-
+    resources: ResourceSchema
 
 class WeekSchema(BaseModel):
     week_number: int
-    skills:      List[SkillSchema]
-
+    skills: List[SkillSchema]
 
 class RoadmapResponse(BaseModel):
-    track_name:             str
-    user_hours_per_week:    int
+    track_name: str
+    user_hours_per_week: int
     total_weeks_calculated: int
-    roadmap:                List[WeekSchema]
+    roadmap: List[WeekSchema]
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _norm(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", (text or "").lower()).strip()
 
-# ---------------------------------------------------------------------------
-# Step 1 — Intelligence: Gemini generates a flat skill list
-# ---------------------------------------------------------------------------
+def _dur(s: str) -> int:
+    if not s:
+        return 0
+    try:
+        p = [int(x) for x in s.strip().split(":")]
+        if len(p) == 3:
+            return p[0] * 3600 + p[1] * 60 + p[2]
+        if len(p) == 2:
+            return p[0] * 60 + p[1]
+        return p[0]
+    except ValueError:
+        return 0
 
+def _ok_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip()
+    if u.lower() in {"", "null", "none", "n/a", "#", '""', "https://", "http://"}:
+        return False
+    if not u.startswith(("http://", "https://")) or len(u) <= 12:
+        return False
+    return not any(p in u.lower() for p in SEARCH_PAGES)
+
+def _skip_url(url: str) -> bool:
+    return any(d in url.lower() for d in SKIP_DOMAINS)
+
+def _yt_watch(url: str) -> bool:
+    ul = url.lower()
+    return "youtube.com/watch" in ul or "youtu.be/" in ul
+
+def _score(text: str, skill: str, good: tuple, bad: tuple = (), duration: int = 0) -> float:
+    t, sn = _norm(text), _norm(skill)
+    tokens = {w for w in sn.split() if len(w) > 2}
+    s = len(tokens & set(t.split())) * 3.0 + (10.0 if sn and sn in t else 0.0)
+    s += sum(1.5 for k in good if k in t)
+    s -= sum(4.0 for k in bad if k in t)
+    if duration >= 3600: s += 10
+    elif duration >= 1800: s += 6
+    elif duration >= YT_MIN_SEC: s += 2
+    elif 0 < duration < 180: s -= 10
+    return s
+
+def _ddg(query: str) -> list[dict]:
+    try:
+        with _ddg_lock:
+            with DDGS() as d:
+                return list(d.text(query, max_results=5))
+    except Exception as exc:
+        logger.debug("DDG fail '%s': %s", query, exc)
+        return []
+
+# ── Step 1: Gemini ────────────────────────────────────────────────────────────
 _GEMINI_SYSTEM = """\
 You are an expert curriculum designer. When given a learning track name, you generate
 a comprehensive, ordered list of skills a learner needs to master, together with
@@ -105,207 +151,172 @@ Rules:
 - Include 10-20 skills ordered from fundamentals to advanced.
 - estimated_hours must be a realistic positive number (e.g. 2, 4, 6…).
 - youtube_link MUST always be an empty string "".
-- book_reference and article_link must be real, accurate references.
+- book_reference must be a real reference (Author – Book Title – Chapter X). Never leave it empty.
+- article_link is REQUIRED for every skill. It MUST be a full https:// URL to a real article,
+  tutorial, or official documentation page. NEVER leave article_link as "" or a placeholder.
+- Prefer official docs and reputable sources (MDN, react.dev, python.org docs, freeCodeCamp, Dev.to).
 - Do NOT wrap the JSON in triple backticks or any markdown.
+
+CRITICAL — track alignment (must follow):
+- Every skill MUST belong directly to the requested track_name. Do NOT output a generic or wrong track.
+- Set track_name in JSON to exactly the track you were asked for.
+- "Backend Web Development" → server-side only: HTTP/REST, databases, SQL, APIs, auth, backends, Docker, testing, deployment.
+  Do NOT list HTML, CSS, React, or frontend UI as skills.
+- "Frontend Web Development" → client-side: HTML, CSS, JavaScript, frameworks, UI, browser APIs.
+  Do NOT list backend-only topics unless directly needed for frontend.
+- Match the track domain exactly (DevOps, Data Science, Mobile, etc.) — never swap tracks.
 """
 
+_TRACK_HINTS = {
+    "backend": "Focus on HTTP/REST, SQL, APIs, auth, server frameworks, Docker. Exclude HTML/CSS/React.",
+    "frontend": "Focus on HTML, CSS, JavaScript, React/Vue, UI. Exclude backend-only topics.",
+}
 
 async def _call_gemini(track_name: str) -> dict:
-    """Call Gemini 1.5 Flash and parse response as JSON."""
-    model  = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=_GEMINI_SYSTEM,
+    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=_GEMINI_SYSTEM)
+
+    hint = ""
+    tn = track_name.lower()
+    if "backend" in tn:
+        hint = " " + _TRACK_HINTS["backend"]
+    elif "frontend" in tn:
+        hint = " " + _TRACK_HINTS["frontend"]
+
+    prompt = (
+        f'Generate a complete learning roadmap ONLY for the track: "{track_name}". '
+        f"Every skill must be specific to this track.{hint} "
+        f'Set track_name in JSON to exactly: "{track_name}".'
     )
-
-    prompt = f'Generate a complete learning roadmap for the track: "{track_name}"'
-
     logger.info("Calling Gemini for track: %s", track_name)
     try:
-        response = await asyncio.to_thread(
-            model.generate_content,
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=8192,
-            ),
+        resp = await asyncio.to_thread(
+            model.generate_content, prompt,
+            generation_config=genai.types.GenerationConfig(temperature=0.2, max_output_tokens=8192),
         )
     except Exception as exc:
-        logger.error("Gemini API error: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM service error: {exc}",
-        )
+        msg = str(exc)
+        if "429" in msg or "quota" in msg.lower():
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Gemini quota exceeded (model: {GEMINI_MODEL}). "
+                    "Free tier is ~20 requests/day per model. "
+                    "Wait a minute and retry, try GEMINI_MODEL=gemini-2.0-flash or gemini-2.5-flash-lite in .env, "
+                    "or enable billing: https://ai.google.dev/gemini-api/docs/rate-limits"
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"LLM service error: {exc}")
 
-    raw_text = response.text.strip()
-
-    # Strip accidental markdown fences if Gemini disobeys
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("```")[1]
-        if raw_text.startswith("json"):
-            raw_text = raw_text[4:]
-        raw_text = raw_text.strip()
-
+    raw = resp.text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
     try:
-        data = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        logger.error("Failed to parse Gemini JSON: %s\nRaw:\n%s", exc, raw_text)
-        raise HTTPException(
-            status_code=502,
-            detail="LLM returned malformed JSON. Please retry.",
-        )
-
-    if "skills" not in data or not isinstance(data["skills"], list):
-        raise HTTPException(
-            status_code=502,
-            detail="LLM response missing 'skills' array.",
-        )
-
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="LLM returned malformed JSON. Please retry.")
+    if not isinstance(data.get("skills"), list):
+        raise HTTPException(status_code=502, detail="LLM response missing 'skills' array.")
+    data["track_name"] = track_name
     return data
 
-
-# ---------------------------------------------------------------------------
-# Step 2 — Verification: YouTube search fills in real links
-# ---------------------------------------------------------------------------
-
-def _search_youtube(query: str) -> str:
-    """Return the first YouTube watch URL for `query`, or empty string on failure."""
+# ── Step 2: Fast resource enrichment ─────────────────────────────────────────
+def _fetch_yt(query: str) -> list:
     try:
-        results = VideosSearch(query, limit=YT_MAX_RESULTS).result()
-        videos  = results.get("result", [])
-        if videos:
-            link = videos[0].get("link", "")
-            logger.info("YT link found for '%s': %s", query, link)
-            return link
-    except Exception as exc:
-        logger.warning("YouTube search failed for '%s': %s", query, exc)
+        return VideosSearch(query, limit=YT_LIMIT).result().get("result", [])
+    except Exception:
+        return []
+
+def _best_yt(videos: list, skill: str) -> dict | None:
+    pool = []
+    for v in videos:
+        title = (v.get("title") or "").lower()
+        link = v.get("link") or ""
+        d = _dur(v.get("duration") or "")
+        if "#shorts" in title or "/shorts" in link or not _yt_watch(link):
+            continue
+        if d and d < YT_MIN_SEC:
+            continue
+        pool.append(v)
+    if not pool:
+        pool = [v for v in videos if _yt_watch(v.get("link") or "") and "/shorts" not in (v.get("link") or "")]
+    if not pool:
+        return None
+    return max(pool, key=lambda v: (_score(v.get("title") or "", skill, YT_GOOD, YT_BAD, _dur(v.get("duration") or "")), _dur(v.get("duration") or "")))
+
+def _search_youtube(skill: str) -> str:
+    for q in (f"{skill} full course tutorial", f"{skill} tutorial"):
+        pick = _best_yt(_fetch_yt(q), skill)
+        if pick and pick.get("link"):
+            return pick["link"]
     return ""
 
+def _article_from_ddg(skill: str) -> str:
+    best_url, best_score = "", -1.0
+    for r in _ddg(f"{skill} tutorial"):
+        url, title = r.get("href", ""), r.get("title", "")
+        if not _ok_url(url) or _skip_url(url):
+            continue
+        sc = _score(f"{title} {url}", skill, ART_GOOD)
+        if sc > best_score:
+            best_score, best_url = sc, url
+    return best_url
 
-async def _enrich_with_youtube(skills: list, track_name: str) -> list:
-    """Run YouTube searches in a thread pool to avoid blocking the event loop."""
+def _resolve_article(skill: str, candidate: str) -> str:
+    if _ok_url(candidate) and not _skip_url(candidate):
+        return candidate.strip()
+    return _article_from_ddg(skill)
 
-    def _enrich_single(skill: dict) -> dict:
-        query = f"{skill['skill_name']} {track_name} tutorial"
-        skill["resources"]["youtube_link"] = _search_youtube(query)
-        return skill
+def _enrich_skill(skill: dict) -> dict:
+    res = skill.setdefault("resources", {})
+    name = skill["skill_name"]
+    res["youtube_link"] = _search_youtube(name)
+    res["article_link"] = _resolve_article(name, res.get("article_link", ""))
+    return skill
 
-    enriched = await asyncio.gather(
-        *[asyncio.to_thread(_enrich_single, skill) for skill in skills]
-    )
-    return list(enriched)
+async def _enrich_resources(skills: list) -> list:
+    sem = asyncio.Semaphore(CONCURRENCY)
+    async def run(s):
+        async with sem:
+            return await asyncio.to_thread(_enrich_skill, s)
+    return list(await asyncio.gather(*[run(s) for s in skills]))
 
-
-# ---------------------------------------------------------------------------
-# Step 3 — Personalization: group skills into weekly schedule
-# ---------------------------------------------------------------------------
-
-def _build_weekly_schedule(
-    skills: list,
-    hours_per_week: int,
-) -> tuple[List[WeekSchema], int]:
-    """
-    Pack skills greedily into weeks.
-
-    A skill is never split across weeks — it is placed into the current week
-    if it fits, otherwise a new week is started.  This keeps each week
-    coherent.  The last week may run slightly over the target if a single
-    skill exceeds hours_per_week; in that case the skill occupies its own week.
-    """
-    weeks: List[WeekSchema] = []
-    current_week_skills: List[SkillSchema] = []
-    current_week_hours: float = 0.0
-    week_num = 1
-
+# ── Step 3: Weekly schedule ───────────────────────────────────────────────────
+def _build_weekly_schedule(skills: list, hours_per_week: int) -> tuple[List[WeekSchema], int]:
+    weeks, cur, hrs, num = [], [], 0.0, 1
     for raw in skills:
         try:
-            res = ResourceSchema(**raw["resources"])
-            skill = SkillSchema(
-                skill_name=raw["skill_name"],
-                estimated_hours=float(raw["estimated_hours"]),
-                resources=res,
-            )
+            skill = SkillSchema(skill_name=raw["skill_name"], estimated_hours=float(raw["estimated_hours"]),
+                                resources=ResourceSchema(**raw["resources"]))
         except Exception as exc:
-            logger.warning("Skipping malformed skill %s: %s", raw.get("skill_name"), exc)
+            logger.warning("Skipping skill %s: %s", raw.get("skill_name"), exc)
             continue
-
-        # If adding this skill would exceed the weekly budget AND we already
-        # have skills in the current week, close the week first.
-        if current_week_skills and (current_week_hours + skill.estimated_hours) > hours_per_week:
-            weeks.append(WeekSchema(week_number=week_num, skills=current_week_skills))
-            week_num += 1
-            current_week_skills = []
-            current_week_hours  = 0.0
-
-        current_week_skills.append(skill)
-        current_week_hours += skill.estimated_hours
-
-    # Flush the last week
-    if current_week_skills:
-        weeks.append(WeekSchema(week_number=week_num, skills=current_week_skills))
-
+        if cur and hrs + skill.estimated_hours > hours_per_week:
+            weeks.append(WeekSchema(week_number=num, skills=cur))
+            num, cur, hrs = num + 1, [], 0.0
+        cur.append(skill)
+        hrs += skill.estimated_hours
+    if cur:
+        weeks.append(WeekSchema(week_number=num, skills=cur))
     return weeks, len(weeks)
 
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="Syntra.AI — Roadmap Factory", version="1.0.0",
+              description="Generates a time-scaled roadmap with verified resources.")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ---------------------------------------------------------------------------
-# FastAPI App
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="Syntra.AI — Roadmap Factory",
-    description=(
-        "Generates a time-scaled learning roadmap with verified YouTube resources. "
-        "Called by the backend only when no cached roadmap exists."
-    ),
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/health", tags=["Health"])
+@app.get("/health")
 async def health_check():
-    """Simple liveness probe."""
     return {"status": "ok", "service": "Syntra.AI Roadmap Factory"}
 
-
-@app.post(
-    "/generate-roadmap",
-    response_model=RoadmapResponse,
-    tags=["Roadmap"],
-    summary="Generate a complete, time-scaled roadmap with verified resources",
-)
+@app.post("/generate-roadmap", response_model=RoadmapResponse)
 async def generate_roadmap(request: RoadmapRequest) -> RoadmapResponse:
-    """
-    **Pipeline:**
-    1. Gemini 1.5 Flash → structured skill list (JSON)
-    2. youtube-search-python → fills real tutorial links per skill
-    3. Time-scaling → groups skills into weekly schedule by `hours_per_week`
-    """
-    # --- Step 1: Intelligence ---
-    logger.info("=== NEW REQUEST | track='%s' | hours_per_week=%d ===",
-                request.track_name, request.hours_per_week)
-
-    gemini_data = await _call_gemini(request.track_name)
-    raw_skills: list = gemini_data["skills"]
-    logger.info("Gemini returned %d skills.", len(raw_skills))
-
-    # --- Step 2: Verification ---
-    logger.info("Enriching skills with YouTube links …")
-    enriched_skills = await _enrich_with_youtube(raw_skills, request.track_name)
-
-    # --- Step 3: Personalization ---
-    logger.info("Building weekly schedule (budget: %d hrs/week) …", request.hours_per_week)
-    weeks, total_weeks = _build_weekly_schedule(enriched_skills, request.hours_per_week)
-    logger.info("Schedule built: %d weeks total.", total_weeks)
-
-    return RoadmapResponse(
-        track_name=request.track_name,
-        user_hours_per_week=request.hours_per_week,
-        total_weeks_calculated=total_weeks,
-        roadmap=weeks,
-    )
+    logger.info("=== track='%s' | %d hrs/week ===", request.track_name, request.hours_per_week)
+    data = await _call_gemini(request.track_name)
+    skills = await _enrich_resources(data["skills"])
+    weeks, total = _build_weekly_schedule(skills, request.hours_per_week)
+    logger.info("Done: %d skills, %d weeks", len(skills), total)
+    return RoadmapResponse(track_name=request.track_name, user_hours_per_week=request.hours_per_week,
+                           total_weeks_calculated=total, roadmap=weeks)
